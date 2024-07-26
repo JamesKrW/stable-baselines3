@@ -10,6 +10,8 @@ from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from stable_baselines3.common.type_aliases import (
     DictReplayBufferSamples,
     DictRolloutBufferSamples,
+    HumanReplayBufferSamples,
+    MixedReplayBufferSamples,
     ReplayBufferSamples,
     RolloutBufferSamples,
 )
@@ -837,3 +839,1015 @@ class DictRolloutBuffer(RolloutBuffer):
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )
+
+class HumanReplayBuffer(BaseBuffer):
+    """
+    Replay buffer used in off-policy algorithms like SAC/TD3.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param n_envs: Number of parallel environments
+    :param optimize_memory_usage: Enable a memory efficient variant
+        of the replay buffer which reduces by almost a factor two the memory used,
+        at a cost of more complexity.
+        See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
+        and https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+        Cannot be used in combination with handle_timeout_termination.
+    :param handle_timeout_termination: Handle timeout termination (due to timelimit)
+        separately and treat the task as infinite horizon task.
+        https://github.com/DLR-RM/stable-baselines3/issues/284
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        n_envs: int = 1,
+        optimize_memory_usage: bool = False,
+        handle_timeout_termination: bool = True,
+    ):
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        # Adjust buffer size
+        self.buffer_size = max(buffer_size // n_envs, 1)
+
+        # Check that the replay buffer can fit into the memory
+        if psutil is not None:
+            mem_available = psutil.virtual_memory().available
+
+        # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
+        # see https://github.com/DLR-RM/stable-baselines3/issues/934
+        if optimize_memory_usage and handle_timeout_termination:
+            raise ValueError(
+                "ReplayBuffer does not support optimize_memory_usage = True "
+                "and handle_timeout_termination = True simultaneously."
+            )
+        self.optimize_memory_usage = optimize_memory_usage
+
+        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        if optimize_memory_usage:
+            # `observations` contains also the next observation
+            self.next_observations = None
+        else:
+            self.next_observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
+
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.human_rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        # Handle timeouts termination properly if needed
+        # see https://github.com/DLR-RM/stable-baselines3/issues/284
+        self.handle_timeout_termination = handle_timeout_termination
+        self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        if psutil is not None:
+            total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
+
+            if self.next_observations is not None:
+                total_memory_usage += self.next_observations.nbytes
+
+            if total_memory_usage > mem_available:
+                # Convert to GB
+                total_memory_usage /= 1e9
+                mem_available /= 1e9
+                warnings.warn(
+                    "This system does not have apparently enough memory to store the complete "
+                    f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
+                )
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        human_reward: np.ndarray,
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+    ) -> None:
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs,) + self.obs_shape)
+            next_obs = next_obs.reshape((self.n_envs,) + self.obs_shape)
+
+        # Same, for actions
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        # Copy to avoid modification by reference
+        self.observations[self.pos] = np.array(obs).copy()
+
+        if self.optimize_memory_usage:
+            self.observations[(self.pos + 1) % self.buffer_size] = np.array(next_obs).copy()
+        else:
+            self.next_observations[self.pos] = np.array(next_obs).copy()
+
+        self.actions[self.pos] = np.array(action).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.human_rewards[self.pos] = np.array(human_reward).copy()
+        self.dones[self.pos] = np.array(done).copy()
+
+        if self.handle_timeout_termination:
+            self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+            self.pos = 0
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> HumanReplayBufferSamples:
+        """
+        Sample elements from the replay buffer.
+        Custom sampling when using memory efficient variant,
+        as we should not sample the element with index `self.pos`
+        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+
+        :param batch_size: Number of element to sample
+        :param env: associated gym VecEnv
+            to normalize the observations/rewards when sampling
+        :return:
+        """
+        if not self.optimize_memory_usage:
+            return super().sample(batch_size=batch_size, env=env)
+        # Do not sample the element with index `self.pos` as the transitions is invalid
+        # (we use only one array to store `obs` and `next_obs`)
+        if self.full:
+            batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
+        else:
+            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+        return self._get_samples(batch_inds, env=env)
+
+    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> HumanReplayBufferSamples:
+        # Sample randomly the env idxs
+        env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+
+        if self.optimize_memory_usage:
+            next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
+        else:
+            next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+
+        data = (
+            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
+            self.actions[batch_inds, env_indices, :],
+            next_obs,
+            # Only use dones that are not due to timeouts
+            # deactivated by default (timeouts is initialized as an array of False)
+            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+            self._normalize_reward(self.human_rewards[batch_inds, env_indices].reshape(-1, 1), env),
+        )
+        return HumanReplayBufferSamples(*tuple(map(self.to_torch, data)))
+
+class BalancedHumanReplayBuffer(BaseBuffer):
+    """
+    Replay buffer used in ef-based off-policy algorithms like TAMER / SEED.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param n_envs: Number of parallel environments
+    :param handle_timeout_termination: Handle timeout termination (due to timelimit)
+        separately and treat the task as infinite horizon task.
+        https://github.com/DLR-RM/stable-baselines3/issues/284
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        n_envs: int = 1,
+        handle_timeout_termination: bool = True,
+    ):
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        self.postive_buffer = HumanReplayBuffer(buffer_size // 2, observation_space, action_space, device, n_envs=n_envs, handle_timeout_termination=handle_timeout_termination)
+        self.negative_buffer = HumanReplayBuffer(buffer_size // 2, observation_space, action_space, device, n_envs=n_envs, handle_timeout_termination=handle_timeout_termination)
+
+    def add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        human_reward: np.ndarray,
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+    ) -> None:
+        
+        if float(human_reward) < 0:
+            self.negative_buffer.add(
+                obs,
+                action,
+                human_reward,
+                done,
+                infos,
+            )
+        else:
+            self.postive_buffer.add(
+                obs,
+                action,
+                human_reward,
+                done,
+                infos,
+            ) 
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> HumanReplayBufferSamples:
+        """
+        Sample elements from the replay buffer.
+        Custom sampling when using memory efficient variant,
+        as we should not sample the element with index `self.pos`
+        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+
+        :param batch_size: Number of element to sample
+        :param env: associated gym VecEnv
+            to normalize the observations/rewards when sampling
+        :return:
+        """
+        if self.postive_buffer.size() == 0:
+            return self.negative_buffer.sample(batch_size, env=env)
+        elif self.negative_buffer.size() == 0:
+            return self.postive_buffer.sample(batch_size, env=env)
+        else:
+            positive_samples = self.postive_buffer.sample(batch_size // 2, env=env)
+            negative_samples = self.negative_buffer.sample(batch_size // 2, env=env)
+            return HumanReplayBufferSamples(*tuple(map(th.cat, zip(positive_samples, negative_samples))))
+
+    def _get_samples(
+        self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None
+    ) -> HumanReplayBufferSamples:
+        raise NotImplementedError()
+
+    def size(self) -> int:
+        """
+        :return: The current size of the buffer
+        """
+        return self.postive_buffer.size() + self.negative_buffer.size()
+
+
+class MixedReplayBufferWithRFArgs(BaseBuffer):
+    """
+    Replay buffer used in ef-based off-policy algorithms like TAMER / SEED.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param n_envs: Number of parallel environments
+    :param handle_timeout_termination: Handle timeout termination (due to timelimit)
+        separately and treat the task as infinite horizon task.
+        https://github.com/DLR-RM/stable-baselines3/issues/284
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        n_envs: int = 1,
+        optimize_memory_usage: bool = False,
+        handle_timeout_termination: bool = True,
+    ):
+        assert optimize_memory_usage==False
+
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        # Adjust buffer size
+        self.buffer_size = max(buffer_size // n_envs, 1)
+
+        # Check that the replay buffer can fit into the memory
+        if psutil is not None:
+            mem_available = psutil.virtual_memory().available
+
+        # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
+        # see https://github.com/DLR-RM/stable-baselines3/issues/934
+        if optimize_memory_usage and handle_timeout_termination:
+            raise ValueError(
+                "ReplayBuffer does not support optimize_memory_usage = True "
+                "and handle_timeout_termination = True simultaneously."
+            )
+        self.optimize_memory_usage = optimize_memory_usage
+
+        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        if optimize_memory_usage:
+            # `observations` contains also the next observation
+            self.next_observations = None
+        else:
+            self.next_observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
+
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.human_rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        # Handle timeouts termination properly if needed
+        # see https://github.com/DLR-RM/stable-baselines3/issues/284
+        self.handle_timeout_termination = handle_timeout_termination
+        self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.rf_args_list = []
+
+        if psutil is not None:
+            total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.human_rewards.nbytes + self.dones.nbytes
+
+            if self.next_observations is not None:
+                total_memory_usage += self.next_observations.nbytes
+
+            if total_memory_usage > mem_available:
+                # Convert to GB
+                total_memory_usage /= 1e9
+                mem_available /= 1e9
+                warnings.warn(
+                    "This system does not have apparently enough memory to store the complete "
+                    f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
+                )
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        human_reward: List[Dict[str, Any]],
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+        rf_args: List[List[Any]]
+    ) -> None:
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs,) + self.obs_shape)
+            next_obs = next_obs.reshape((self.n_envs,) + self.obs_shape)
+
+        # Same, for actions
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        # Copy to avoid modification by reference
+        self.observations[self.pos] = np.array(obs).copy()
+
+        if self.optimize_memory_usage:
+            self.observations[(self.pos + 1) % self.buffer_size] = np.array(next_obs).copy()
+        else:
+            self.next_observations[self.pos] = np.array(next_obs).copy()
+
+        self.actions[self.pos] = np.array(action).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.human_rewards[self.pos] = np.array(human_reward).copy()
+        self.dones[self.pos] = np.array(done).copy()
+
+        if self.handle_timeout_termination:
+            self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
+
+        if not self.full and self.pos==len(self.rf_args_list):
+            self.rf_args_list.append(rf_args)
+        else:
+            self.rf_args_list[self.pos] = rf_args
+
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+            self.pos = 0
+
+    def relabel(self, new_rf, method = "random", num_transaction = -1):
+        if num_transaction == -1:
+            for i, batch_rf_args in enumerate(self.rf_args_list):
+                for j, args in enumerate(batch_rf_args):
+                    human_reward, components = new_rf(*args)
+                    self.human_rewards[i][j] = human_reward
+            return
+
+        num_transaction = min(num_transaction, self.size())
+        if method == "random":
+            for i, batch_rf_args in enumerate(self.rf_args_list):
+                for j, args in enumerate(batch_rf_args):
+                    human_reward, components = new_rf(*args)
+                    self.human_rewards[i][j] = human_reward
+            return self.uniform_downsample(num_transaction)
+        elif method == "uniform":
+            for i, batch_rf_args in enumerate(self.rf_args_list):
+                for j, args in enumerate(batch_rf_args):
+                    human_reward, components = new_rf(*args)
+                    self.human_rewards[i][j] = human_reward
+            return self.downsample(num_transaction)
+
+    def get_dist(self):
+        buckets = [[] for _ in range(201)] 
+        for i in range(self.pos):
+            hr = self.human_rewards[i]
+            buckets[int((hr[0] + 1) * 100)].append(i)
+
+        dist = [len(b) for b in buckets]
+        return dist, buckets
+    
+    def uniform_downsample(self, num_transaction):
+        before_reward = [h[0] for h in self.human_rewards[:self.pos]] 
+
+        id_list = np.arange(self.pos)
+        np.random.shuffle(id_list)
+        id_list = id_list[:num_transaction]
+        id_list.sort()
+        for new_id, id in enumerate(id_list):
+            self.observations[new_id] = self.observations[id]
+            self.next_observations[new_id] = self.next_observations[id]
+            self.actions[new_id] = self.actions[id]
+            self.rewards[new_id] = self.rewards[id]
+            self.human_rewards[new_id] = self.human_rewards[id]
+            self.dones[new_id] = self.dones[id]
+            self.timeouts[new_id] = self.timeouts[id]
+            self.rf_args_list[new_id] = self.rf_args_list[id]
+
+        self.pos = num_transaction
+        if self.pos != self.buffer_size:
+            self.full = False
+
+        after_reward = [h[0] for h in self.human_rewards[:self.pos]] 
+
+        return before_reward, after_reward
+    
+    def downsample(self, num_transaction):
+        distirbution_before, buckets = self.get_dist()
+        
+        before_reward = [h[0] for h in self.human_rewards[:self.pos]] 
+
+        id_list = []
+        while len(id_list) != num_transaction:
+            for b in buckets:
+                if len(b):
+                    id_list.append(b.pop())
+                if len(id_list) == num_transaction:
+                    break
+        id_list.sort()
+        for new_id, id in enumerate(id_list):
+            self.observations[new_id] = self.observations[id]
+            self.next_observations[new_id] = self.next_observations[id]
+            self.actions[new_id] = self.actions[id]
+            self.rewards[new_id] = self.rewards[id]
+            self.human_rewards[new_id] = self.human_rewards[id]
+            self.dones[new_id] = self.dones[id]
+            self.timeouts[new_id] = self.timeouts[id]
+            self.rf_args_list[new_id] = self.rf_args_list[id]
+
+        self.pos = num_transaction
+        if self.pos != self.buffer_size:
+            self.full = False
+
+        after_reward = [h[0] for h in self.human_rewards[:self.pos]] 
+
+        return before_reward, after_reward
+
+        
+
+    def reset(self):
+        self.rf_args_list = []
+        super().reset()
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        """
+        Sample elements from the replay buffer.
+        Custom sampling when using memory efficient variant,
+        as we should not sample the element with index `self.pos`
+        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+
+        :param batch_size: Number of element to sample
+        :param env: associated gym VecEnv
+            to normalize the observations/rewards when sampling
+        :return:
+        """
+        if not self.optimize_memory_usage:
+            return super().sample(batch_size=batch_size, env=env)
+        # Do not sample the element with index `self.pos` as the transitions is invalid
+        # (we use only one array to store `obs` and `next_obs`)
+        if self.full:
+            batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
+        else:
+            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+        return self._get_samples(batch_inds, env=env)
+
+    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        # Sample randomly the env idxs
+        env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+
+        if self.optimize_memory_usage:
+            next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
+        else:
+            next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+
+        data = (
+            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
+            self.actions[batch_inds, env_indices, :],
+            next_obs,
+            # Only use dones that are not due to timeouts
+            # deactivated by default (timeouts is initialized as an array of False)
+            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+            # self.human_rewards[batch_inds, env_indices].reshape(-1, 1),
+            self._normalize_reward(self.human_rewards[batch_inds, env_indices].reshape(-1, 1), env),
+        )
+        return MixedReplayBufferSamples(*tuple(map(self.to_torch, data)))
+    
+class MixedReplayBuffer(BaseBuffer):
+    """
+    Replay buffer used in ef-based off-policy algorithms like TAMER / SEED.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param n_envs: Number of parallel environments
+    :param optimize_memory_usage: Enable a memory efficient variant
+        of the replay buffer which reduces by almost a factor two the memory used,
+        at a cost of more complexity.
+        See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
+        and https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+        Cannot be used in combination with handle_timeout_termination.
+    :param handle_timeout_termination: Handle timeout termination (due to timelimit)
+        separately and treat the task as infinite horizon task.
+        https://github.com/DLR-RM/stable-baselines3/issues/284
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        n_envs: int = 1,
+        optimize_memory_usage: bool = False,
+        handle_timeout_termination: bool = True,
+    ):
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        # Adjust buffer size
+        self.buffer_size = max(buffer_size // n_envs, 1)
+
+        # Check that the replay buffer can fit into the memory
+        if psutil is not None:
+            mem_available = psutil.virtual_memory().available
+
+        # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
+        # see https://github.com/DLR-RM/stable-baselines3/issues/934
+        if optimize_memory_usage and handle_timeout_termination:
+            raise ValueError(
+                "ReplayBuffer does not support optimize_memory_usage = True "
+                "and handle_timeout_termination = True simultaneously."
+            )
+        self.optimize_memory_usage = optimize_memory_usage
+
+        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        if optimize_memory_usage:
+            # `observations` contains also the next observation
+            self.next_observations = None
+        else:
+            self.next_observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
+
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.human_rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        # Handle timeouts termination properly if needed
+        # see https://github.com/DLR-RM/stable-baselines3/issues/284
+        self.handle_timeout_termination = handle_timeout_termination
+        self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        if psutil is not None:
+            total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.human_rewards.nbytes + self.dones.nbytes
+
+            if self.next_observations is not None:
+                total_memory_usage += self.next_observations.nbytes
+
+            if total_memory_usage > mem_available:
+                # Convert to GB
+                total_memory_usage /= 1e9
+                mem_available /= 1e9
+                warnings.warn(
+                    "This system does not have apparently enough memory to store the complete "
+                    f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
+                )
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        human_reward: np.ndarray,
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+    ) -> None:
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs,) + self.obs_shape)
+            next_obs = next_obs.reshape((self.n_envs,) + self.obs_shape)
+
+        # Same, for actions
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        # Copy to avoid modification by reference
+        self.observations[self.pos] = np.array(obs).copy()
+
+        if self.optimize_memory_usage:
+            self.observations[(self.pos + 1) % self.buffer_size] = np.array(next_obs).copy()
+        else:
+            self.next_observations[self.pos] = np.array(next_obs).copy()
+
+        self.actions[self.pos] = np.array(action).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.human_rewards[self.pos] = np.array(human_reward).copy()
+        self.dones[self.pos] = np.array(done).copy()
+
+        if self.handle_timeout_termination:
+            self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+            self.pos = 0
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        """
+        Sample elements from the replay buffer.
+        Custom sampling when using memory efficient variant,
+        as we should not sample the element with index `self.pos`
+        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+
+        :param batch_size: Number of element to sample
+        :param env: associated gym VecEnv
+            to normalize the observations/rewards when sampling
+        :return:
+        """
+        if not self.optimize_memory_usage:
+            return super().sample(batch_size=batch_size, env=env)
+        # Do not sample the element with index `self.pos` as the transitions is invalid
+        # (we use only one array to store `obs` and `next_obs`)
+        if self.full:
+            batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
+        else:
+            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+        return self._get_samples(batch_inds, env=env)
+
+    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        # Sample randomly the env idxs
+        env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+
+        if self.optimize_memory_usage:
+            next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
+        else:
+            next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+
+        data = (
+            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
+            self.actions[batch_inds, env_indices, :],
+            next_obs,
+            # Only use dones that are not due to timeouts
+            # deactivated by default (timeouts is initialized as an array of False)
+            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+            # self.human_rewards[batch_inds, env_indices].reshape(-1, 1),
+            self._normalize_reward(self.human_rewards[batch_inds, env_indices].reshape(-1, 1), env),
+        )
+        return MixedReplayBufferSamples(*tuple(map(self.to_torch, data)))
+    
+class BalancedMixedReplayBuffer(BaseBuffer):
+    """
+    Replay buffer used in ef-based off-policy algorithms like TAMER / SEED.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param n_envs: Number of parallel environments
+    :param handle_timeout_termination: Handle timeout termination (due to timelimit)
+        separately and treat the task as infinite horizon task.
+        https://github.com/DLR-RM/stable-baselines3/issues/284
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        n_envs: int = 1,
+        handle_timeout_termination: bool = True,
+    ):
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        self.postive_buffer = MixedReplayBuffer(buffer_size // 2, observation_space, action_space, device, n_envs=n_envs, handle_timeout_termination=handle_timeout_termination)
+        self.negative_buffer = MixedReplayBuffer(buffer_size // 2, observation_space, action_space, device, n_envs=n_envs, handle_timeout_termination=handle_timeout_termination)
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        human_reward: np.ndarray,
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+    ) -> None:
+        
+        if float(human_reward) < 0:
+            self.negative_buffer.add(
+                obs,
+                next_obs,
+                action,
+                reward,
+                human_reward,
+                done,
+                infos,
+            )
+        else:
+            self.postive_buffer.add(
+                obs,
+                next_obs,
+                action,
+                reward,
+                human_reward,
+                done,
+                infos,
+            ) 
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        """
+        Sample elements from the replay buffer.
+        Custom sampling when using memory efficient variant,
+        as we should not sample the element with index `self.pos`
+        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+
+        :param batch_size: Number of element to sample
+        :param env: associated gym VecEnv
+            to normalize the observations/rewards when sampling
+        :return:
+        """
+        if self.postive_buffer.size() == 0:
+            return self.negative_buffer.sample(batch_size, env=env)
+        elif self.negative_buffer.size() == 0:
+            return self.postive_buffer.sample(batch_size, env=env)
+        else:
+            positive_samples = self.postive_buffer.sample(batch_size // 2, env=env)
+            negative_samples = self.negative_buffer.sample(batch_size // 2, env=env)
+            return MixedReplayBufferSamples(*tuple(map(th.cat, zip(positive_samples, negative_samples))))
+
+    def _get_samples(
+        self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None
+    ) -> MixedReplayBufferSamples:
+        raise NotImplementedError()
+
+    def size(self) -> int:
+        """
+        :return: The current size of the buffer
+        """
+        return self.postive_buffer.size() + self.negative_buffer.size()
+        
+class MixedReplayBufferNormalize(BaseBuffer):
+    """
+    Replay buffer used in ef-based off-policy algorithms like TAMER / SEED.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param n_envs: Number of parallel environments
+    :param handle_timeout_termination: Handle timeout termination (due to timelimit)
+        separately and treat the task as infinite horizon task.
+        https://github.com/DLR-RM/stable-baselines3/issues/284
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        n_envs: int = 1,
+        optimize_memory_usage: bool = False,
+        handle_timeout_termination: bool = True,
+        method = "none"
+    ):
+        assert optimize_memory_usage==False
+
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        # Adjust buffer size
+        self.buffer_size = max(buffer_size // n_envs, 1)
+
+        # Check that the replay buffer can fit into the memory
+        if psutil is not None:
+            mem_available = psutil.virtual_memory().available
+
+        # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
+        # see https://github.com/DLR-RM/stable-baselines3/issues/934
+        if optimize_memory_usage and handle_timeout_termination:
+            raise ValueError(
+                "ReplayBuffer does not support optimize_memory_usage = True "
+                "and handle_timeout_termination = True simultaneously."
+            )
+        self.optimize_memory_usage = optimize_memory_usage
+
+        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        if optimize_memory_usage:
+            # `observations` contains also the next observation
+            self.next_observations = None
+        else:
+            self.next_observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+
+        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
+
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.human_rewards = []
+        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        # Handle timeouts termination properly if needed
+        # see https://github.com/DLR-RM/stable-baselines3/issues/284
+        self.handle_timeout_termination = handle_timeout_termination
+        self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.rf_args_list = []
+
+        self.reward_stats = {}
+        self.method = method
+
+    def update_component_stats(self, reward_component):
+        for k in reward_component:
+            value = reward_component[k]
+            if k in self.reward_stats:
+                self.reward_stats[k]["mean"] += (value - self.reward_stats[k]["mean"])*(1000/self.buffer_size)
+                self.reward_stats[k]["sq_mean"] += (value**2 - self.reward_stats[k]["sq_mean"])*(1000/self.buffer_size)
+            else:
+                self.reward_stats[k] = {"mean": 0, "sq_mean": 0}
+                self.reward_stats[k]["mean"] += (value - self.reward_stats[k]["mean"])*(1000/self.buffer_size)
+                self.reward_stats[k]["sq_mean"] += (value**2 - self.reward_stats[k]["sq_mean"])*(1000/self.buffer_size)
+
+    def combine_component(self, reward_component):
+        num_comp = 0
+        total_rw = 0
+        for k in reward_component:
+            if self.method == "baseline":
+                mu = self.reward_stats[k]["mean"]
+                std = (self.reward_stats[k]["sq_mean"] - self.reward_stats[k]["mean"] ** 2) ** (1/2)
+                total_rw += (reward_component[k] - mu)
+                # print("baseline")
+            elif self.method =="standard":
+                # print("standard")
+                mu = self.reward_stats[k]["mean"]
+                std = (self.reward_stats[k]["sq_mean"] - self.reward_stats[k]["mean"] ** 2) ** (1/2)
+                total_rw += (reward_component[k] - mu) / max(std, 0.1)
+            else:
+                total_rw += reward_component[k]
+                # print("nah?")
+            num_comp += 1
+
+        return total_rw #/num_comp if num_comp else 0
+    
+    def relabel(self, new_rf):
+
+        # reset reward stats:
+        for k in self.reward_stats:
+            self.reward_stats[k]["mean"] = 0 
+            self.reward_stats[k]["sq_mean"] = 0 
+        
+        for i, batch_rf_args in enumerate(self.rf_args_list):
+            for j, args in enumerate(batch_rf_args):
+                reward_components = new_rf(*args)
+                self.update_component_stats(reward_components)
+                self.human_rewards[i][j] = reward_components
+    
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        human_reward_component: List[Dict[str, Any]],
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+        rf_args: List[List[Any]]
+    ) -> None:
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs,) + self.obs_shape)
+            next_obs = next_obs.reshape((self.n_envs,) + self.obs_shape)
+
+        # Same, for actions
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        # Copy to avoid modification by reference
+        self.observations[self.pos] = np.array(obs).copy()
+
+        if self.optimize_memory_usage:
+            self.observations[(self.pos + 1) % self.buffer_size] = np.array(next_obs).copy()
+        else:
+            self.next_observations[self.pos] = np.array(next_obs).copy()
+
+        self.actions[self.pos] = np.array(action).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.dones[self.pos] = np.array(done).copy()
+
+        if self.handle_timeout_termination:
+            self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
+
+        if not self.full and self.pos==len(self.rf_args_list):
+            self.rf_args_list.append(rf_args)
+            self.human_rewards.append(human_reward_component)
+        else:
+            self.rf_args_list[self.pos] = rf_args
+            self.human_rewards[self.pos] = human_reward_component
+
+        for c in human_reward_component:
+            self.update_component_stats(c)
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+            self.pos = 0
+
+    # def relabel(self, new_rf, method = "random", num_transaction = -1):
+    #     if num_transaction == -1:
+    #         for i, batch_rf_args in enumerate(self.rf_args_list):
+    #             for j, args in enumerate(batch_rf_args):
+    #                 human_reward, components = new_rf(*args)
+    #                 self.human_rewards[i][j] = human_reward
+    #         return
+
+    #     num_transaction = min(num_transaction, self.size())
+    #     if method == "random":
+    #         for i, batch_rf_args in enumerate(self.rf_args_list):
+    #             for j, args in enumerate(batch_rf_args):
+    #                 human_reward, components = new_rf(*args)
+    #                 self.human_rewards[i][j] = human_reward
+    #         return self.uniform_downsample(num_transaction)
+    #     elif method == "uniform":
+    #         for i, batch_rf_args in enumerate(self.rf_args_list):
+    #             for j, args in enumerate(batch_rf_args):
+    #                 human_reward, components = new_rf(*args)
+    #                 self.human_rewards[i][j] = human_reward
+    #         return self.downsample(num_transaction)
+        
+
+    def reset(self):
+        self.rf_args_list = []
+        self.reward_stats = {}
+        super().reset()
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        """
+        Sample elements from the replay buffer.
+        Custom sampling when using memory efficient variant,
+        as we should not sample the element with index `self.pos`
+        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
+
+        :param batch_size: Number of element to sample
+        :param env: associated gym VecEnv
+            to normalize the observations/rewards when sampling
+        :return:
+        """
+        if not self.optimize_memory_usage:
+            return super().sample(batch_size=batch_size, env=env)
+        # Do not sample the element with index `self.pos` as the transitions is invalid
+        # (we use only one array to store `obs` and `next_obs`)
+        if self.full:
+            batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
+        else:
+            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+        return self._get_samples(batch_inds, env=env)
+
+    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> MixedReplayBufferSamples:
+        # Sample randomly the env idxs
+        env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+
+        if self.optimize_memory_usage:
+            next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
+        else:
+            next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+
+        combined_human_rewards = []
+        for b,e in zip(batch_inds,env_indices):
+            combined_human_rewards.append(self.combine_component(self.human_rewards[b][e]))
+        
+        data = (
+            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
+            self.actions[batch_inds, env_indices, :],
+            next_obs,
+            # Only use dones that are not due to timeouts
+            # deactivated by default (timeouts is initialized as an array of False)
+            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+            # self.human_rewards[batch_inds, env_indices].reshape(-1, 1),
+            np.array(combined_human_rewards, dtype=np.float32).reshape(-1, 1),
+        )
+        return MixedReplayBufferSamples(*tuple(map(self.to_torch, data)))
