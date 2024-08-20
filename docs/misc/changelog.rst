@@ -3,14 +3,23 @@
 Changelog
 ==========
 
-Release 2.4.0a5 (WIP)
+Release 2.4.0a8 (WIP)
 --------------------------
+
+.. note::
+
+  DQN (and QR-DQN) models saved with SB3 < 2.4.0 will show a warning about
+  truncation of optimizer state when loaded with SB3 >= 2.4.0.
+  To suppress the warning, simply save the model again.
+  You can find more info in `PR #1963 <https://github.com/DLR-RM/stable-baselines3/pull/1963>`_
 
 Breaking Changes:
 ^^^^^^^^^^^^^^^^^
 
 New Features:
 ^^^^^^^^^^^^^
+- Added support for ``pre_linear_modules`` and ``post_linear_modules`` in ``create_mlp`` (useful for adding normalization layers, like in DroQ or CrossQ)
+- Enabled np.ndarray logging for TensorBoardOutputFormat as histogram (see GH#1634) (@iwishwasaneagle)
 
 Bug Fixes:
 ^^^^^^^^^^
@@ -21,15 +30,19 @@ Bug Fixes:
 - Fixed error when loading a model that has ``net_arch`` manually set to ``None``   (@jak3122)
 - Set requirement numpy<2.0 until PyTorch is compatible (https://github.com/pytorch/pytorch/issues/107302)
 - Updated DQN optimizer input to only include q_network parameters, removing the target_q_network ones (@corentinlger)
+- Fixed ``test_buffers.py::test_device`` which was not actually checking the device of tensors (@rhaps0dy)
+
 
 `SB3-Contrib`_
 ^^^^^^^^^^^^^^
 
 `RL Zoo`_
 ^^^^^^^^^
+- Updated defaults hyperparameters for TQC/SAC for Swimmer-v4 (decrease gamma for more consistent results)
 
 `SBX`_ (SB3 + Jax)
 ^^^^^^^^^^^^^^^^^^
+- Added CNN support for DQN
 
 Deprecations:
 ^^^^^^^^^^^^^
