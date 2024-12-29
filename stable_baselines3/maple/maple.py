@@ -529,7 +529,7 @@ class MAPLE(OffPolicyAlgorithm):
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
 
-            self.num_timesteps += sum([info["num_timesteps"] for info in infos])
+            self.num_timesteps += sum([info["num_timesteps"] for info in infos]) # low level steps
             self.num_skill_timesteps += env.num_envs
             num_collected_steps += 1
 
