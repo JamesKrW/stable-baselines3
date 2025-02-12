@@ -2045,6 +2045,7 @@ class BalancedStageReplyBuffer(BaseBuffer):
         n_envs: int = 1,
         n_stage: int = 2,
         handle_timeout_termination: bool = True,
+        optimize_memory_usage: bool = False
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
         self.n_stage = n_stage
